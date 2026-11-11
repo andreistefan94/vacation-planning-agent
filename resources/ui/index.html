@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Vacation Assistant</title>
+<style>
+  :root { color-scheme: light; }
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 0 auto; padding: 16px; background: #f7f7f8; }
+  h1 { font-size: 1.1rem; color: #333; }
+  #setup { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+  #setup input, #setup select { flex: 1; min-width: 140px; padding: 6px 8px; }
+  #prefs { background: #fff; border: 1px solid #ddd; border-radius: 8px; margin-bottom: 12px; }
+  #prefs summary { cursor: pointer; padding: 8px 12px; font-size: 0.9rem; font-weight: 600; color: #333; }
+  #prefsBody { padding: 0 12px 12px; }
+  #prefsList { margin: 4px 0 8px; padding-left: 20px; font-size: 0.9rem; }
+  #prefsList:empty { display: none; }
+  #prefsStatus { font-size: 0.8rem; color: #888; margin-bottom: 8px; }
+  #prefsBody button { padding: 4px 10px; margin-right: 6px; border-radius: 6px; border: 1px solid #ccc; background: #fff; cursor: pointer; }
+  #log { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 12px; height: 60vh; overflow-y: auto; margin-bottom: 12px; }
+  .msg { margin: 8px 0; padding: 8px 12px; border-radius: 10px; max-width: 85%; white-space: pre-wrap; line-height: 1.4; }
+  .user { background: #2563eb; color: #fff; margin-left: auto; }
+  .assistant { background: #eee; color: #111; }
+  .approval { background: #fff3cd; border: 1px solid #ffe08a; }
+  .toolcall, .toolresult { background: transparent; color: #888; font-family: ui-monospace, monospace; font-size: 0.8rem; padding: 2px 12px; max-width: 100%; }
+  .options button { margin: 4px 4px 0 0; padding: 4px 10px; border-radius: 6px; border: 1px solid #ccc; background: #fff; cursor: pointer; }
+  #composer { display: flex; gap: 8px; }
+  #composer input { flex: 1; padding: 8px; }
+  #composer button { padding: 8px 16px; }
+  #status { font-size: 0.8rem; color: #888; margin-bottom: 8px; }
+</style>
+</head>
+<body>
+  <h1>Vacation Planning Assistant</h1>
+  <div id="setup">
+    <input id="userId" placeholder="user_id (e.g. John)" value="John" />
+    <select id="convSelect" style="display:none"><option value="">-- new conversation --</option></select>
+    <input id="convInput" placeholder="conversation_id (blank = new)" style="display:none" />
+    <button id="resetBtn">New conversation</button>
+  </div>
+
+  <details id="prefs">
+    <summary>Long-term preferences</summary>
+    <div id="prefsBody">
+      <ul id="prefsList"></ul>
+      <div id="prefsStatus"></div>
+      <button id="prefsRefreshBtn">Refresh</button>
+      <button id="prefsForgetBtn">Forget all</button>
+    </div>
+  </details>
+
+  <div id="status"></div>
+  <div id="log"></div>
+  <div id="composer">
+    <input id="input" placeholder="Type a message..." />
+    <button id="sendBtn">Send</button>
+  </div>
+
+<script>
+const log = document.getElementById('log');
+const statusEl = document.getElementById('status');
+const userIdEl = document.getElementById('userId');
+const convSelectEl = document.getElementById('convSelect');
+const convInputEl = document.getElementById('convInput');
+const inputEl = document.getElementById('input');
+const prefsEl = document.getElementById('prefs');
+const prefsListEl = document.getElementById('prefsList');
+const prefsStatusEl = document.getElementById('prefsStatus');
+
+// ---------------------------------------------------------------------------
+// Conversation picker, backed by GET /users/{user_id}/conversations - this
+// endpoint is optional/additive (see /docs on this agent), so a target that
+// 404s on it just gets a plain text field to paste a known conversation_id
+// into instead, same as before this endpoint existed. `listSupported`
+// tracks which mode we're in.
+// ---------------------------------------------------------------------------
+let listSupported = true; // optimistic default until the first probe resolves
+
+function currentConversationId() {
+  return ((listSupported ? convSelectEl.value : convInputEl.value) || '').trim();
+}
+
+function applyConvPickerMode() {
+  convSelectEl.style.display = listSupported ? '' : 'none';
+  convInputEl.style.display = listSupported ? 'none' : '';
+}
+
+function renderConvOptions(conversations, selectedId) {
+  convSelectEl.innerHTML = '';
+  const blankOpt = document.createElement('option');
+  blankOpt.value = '';
+  blankOpt.textContent = '-- new conversation --';
+  convSelectEl.appendChild(blankOpt);
+  conversations.forEach((c) => {
+    const opt = document.createElement('option');
+    opt.value = c.conversation_id;
+    opt.textContent = c.preview ? c.preview : c.conversation_id.slice(0, 8);
+    convSelectEl.appendChild(opt);
+  });
+  convSelectEl.value = selectedId && conversations.some((c) => c.conversation_id === selectedId) ? selectedId : '';
+}
+
+async function refreshConversationList(selectedId) {
+  const userId = userIdEl.value || 'anonymous';
+  try {
+    const res = await fetch(`/users/${encodeURIComponent(userId)}/conversations`);
+    if (res.ok) {
+      listSupported = true;
+      const data = await res.json();
+      renderConvOptions(data.conversations || [], selectedId);
+    } else {
+      listSupported = false;
+      convInputEl.value = selectedId || '';
+    }
+  } catch (e) {
+    listSupported = false;
+    convInputEl.value = selectedId || '';
+  }
+  applyConvPickerMode();
+}
+
+function addMessage(role, text, extraClass) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + role + (extraClass ? ' ' + extraClass : '');
+  div.textContent = text;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+  return div;
+}
+
+// Renders one message from GET /conversations/{id} (used when resuming a
+// conversation picked from the dropdown, or entered manually). tool_calls/
+// tool_call_id are the optional debug fields (see /docs on this agent) -
+// shown dimmed, for transparency while testing your own agent, never
+// required to be present.
+function renderHistoryMessage(m) {
+  if (m.role === 'user') {
+    if (m.content) addMessage('user', m.content);
+  } else if (m.role === 'tool') {
+    if (m.content) addMessage('assistant', '↳ ' + m.content, 'toolresult');
+  } else if (m.role === 'assistant') {
+    (m.tool_calls || []).forEach((tc) => {
+      addMessage('assistant', `🔧 ${tc.name}(${JSON.stringify(tc.args || {})})`, 'toolcall');
+    });
+    if (m.content) addMessage('assistant', m.content);
+  }
+  // 'system' messages are internal bookkeeping, not shown.
+}
+
+async function loadConversation(conversationId) {
+  log.innerHTML = '';
+  if (!conversationId) {
+    statusEl.textContent = '';
+    return;
+  }
+  statusEl.textContent = 'loading conversation...';
+  try {
+    const res = await fetch(`/conversations/${encodeURIComponent(conversationId)}`);
+    if (!res.ok) {
+      statusEl.textContent = `could not load conversation: ${res.status}`;
+      return;
+    }
+    const data = await res.json();
+    (data.messages || []).forEach(renderHistoryMessage);
+    statusEl.textContent = '';
+  } catch (e) {
+    statusEl.textContent = 'network error: ' + e;
+  }
+}
+
+async function send(message) {
+  if (!message) return;
+  addMessage('user', message);
+  inputEl.value = '';
+  statusEl.textContent = 'thinking...';
+  try {
+    const res = await fetch('/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        user_id: userIdEl.value || 'anonymous',
+        conversation_id: currentConversationId() || null,
+        message,
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      addMessage('assistant', 'Error: ' + err);
+      statusEl.textContent = '';
+      return;
+    }
+    const data = await res.json();
+    if (data.conversation_id) {
+      refreshConversationList(data.conversation_id);
+    }
+    if (data.status === 'awaiting_approval') {
+      const div = addMessage('assistant', data.reply, 'approval');
+      if (data.pending_approval && data.pending_approval.options && data.pending_approval.options.length) {
+        const opts = document.createElement('div');
+        opts.className = 'options';
+        data.pending_approval.options.forEach((opt) => {
+          const btn = document.createElement('button');
+          btn.textContent = opt;
+          btn.onclick = () => send(opt);
+          opts.appendChild(btn);
+        });
+        div.appendChild(document.createElement('br'));
+        div.appendChild(opts);
+      }
+      statusEl.textContent = 'awaiting your approval/decision above';
+    } else {
+      addMessage('assistant', data.reply);
+      statusEl.textContent = '';
+    }
+  } catch (e) {
+    addMessage('assistant', 'Network error: ' + e);
+    statusEl.textContent = '';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Long-term preferences panel (collapsible: not every implementation adds
+// memory - enunt.txt §2.4 is optional - so this stays out of the way, and a
+// 404/error here is treated as "not implemented by this agent", not a bug).
+// ---------------------------------------------------------------------------
+async function loadPreferences() {
+  const userId = userIdEl.value || 'anonymous';
+  prefsStatusEl.textContent = 'loading...';
+  prefsListEl.innerHTML = '';
+  try {
+    const res = await fetch(`/users/${encodeURIComponent(userId)}/preferences`);
+    if (!res.ok) {
+      prefsStatusEl.textContent = res.status === 404 ? 'not implemented by this agent' : `error: ${res.status}`;
+      return;
+    }
+    const data = await res.json();
+    const prefs = data.preferences || [];
+    if (!prefs.length) {
+      prefsStatusEl.textContent = 'no preferences stored yet';
+    } else {
+      prefsStatusEl.textContent = '';
+      prefs.forEach((p) => {
+        const li = document.createElement('li');
+        li.textContent = p;
+        prefsListEl.appendChild(li);
+      });
+    }
+  } catch (e) {
+    prefsStatusEl.textContent = 'network error: ' + e;
+  }
+}
+
+async function forgetPreferences() {
+  const userId = userIdEl.value || 'anonymous';
+  if (!confirm(`Forget all long-term preferences for "${userId}"?`)) return;
+  try {
+    await fetch(`/users/${encodeURIComponent(userId)}/preferences`, { method: 'DELETE' });
+  } catch (e) { /* surfaced by the refresh below */ }
+  loadPreferences();
+}
+
+document.getElementById('sendBtn').onclick = () => send(inputEl.value.trim());
+inputEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') send(inputEl.value.trim()); });
+document.getElementById('resetBtn').onclick = () => {
+  convSelectEl.value = '';
+  convInputEl.value = '';
+  log.innerHTML = '';
+  statusEl.textContent = '';
+};
+convSelectEl.addEventListener('change', () => loadConversation(convSelectEl.value));
+convInputEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') loadConversation(convInputEl.value.trim()); });
+userIdEl.addEventListener('change', () => {
+  log.innerHTML = '';
+  statusEl.textContent = '';
+  refreshConversationList('');
+  if (prefsEl.open) loadPreferences();
+});
+prefsEl.addEventListener('toggle', () => { if (prefsEl.open) loadPreferences(); });
+document.getElementById('prefsRefreshBtn').onclick = loadPreferences;
+document.getElementById('prefsForgetBtn').onclick = forgetPreferences;
+
+refreshConversationList('');
+</script>
+</body>
+</html>
